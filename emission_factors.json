@@ -1,0 +1,41 @@
+{
+  "factors": {
+    "gwp": {
+      "CO2": 1,
+      "CH4": 28,
+      "N2O": 265,
+      "SO2": 0.0
+    },
+    "activity_factors": {
+      "electricity": {
+        "unit": "kWh",
+        "CO2": 0.5,
+        "CH4": 0.0001,
+        "N2O": 5e-05
+      },
+      "diesel": {
+        "unit": "liter",
+        "CO2": 2.68,
+        "CH4": 0.0002,
+        "N2O": 0.0001
+      },
+      "petrol": {
+        "unit": "liter",
+        "CO2": 2.31,
+        "CH4": 0.00015,
+        "N2O": 5e-05
+      },
+      "fertilizer": {
+        "unit": "kg",
+        "CO2": 0.0,
+        "CH4": 0.0,
+        "N2O": 0.3
+      }
+    },
+    "last_updated": "2025-12-04T15:23:18.258128"
+  },
+  "thresholds": {
+    "low": 500.0,
+    "medium": 2000.0
+  }
+}

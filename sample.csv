@@ -1,0 +1,4 @@
+source_id,activity_date,activity_type,quantity,unit,gas
+A1,2025-01-10,electricity,150,kWh,CO2
+A2,2025-01-12,diesel,50,liter,CO2
+A3,2025-01-15,fertilizer,10,kg,N2O
