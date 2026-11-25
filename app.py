@@ -808,7 +808,26 @@ def process_rows_backend(rows, selected_gases):
 
                 continue
 
-            emissions_kg = q_converted * float(fac_val)
+            # Vehicle-age adjustment applies only to petrol/diesel rows that
+            # include manufacturing-year metadata. Fuel quantity remains part
+            # of the calculation: litres x base fuel factor x age multiplier.
+            vehicle_age = r.get("vehicle_age_years")
+            age_multiplier = 1.0
+            if key in ("petrol", "diesel") and vehicle_age is not None:
+                try:
+                    vehicle_age = max(0, int(vehicle_age))
+                except (TypeError, ValueError):
+                    vehicle_age = 0
+                if vehicle_age <= 5:
+                    age_multiplier = 1.00
+                elif vehicle_age <= 10:
+                    age_multiplier = 1.10
+                elif vehicle_age <= 15:
+                    age_multiplier = 1.20
+                else:
+                    age_multiplier = 1.30
+
+            emissions_kg = q_converted * float(fac_val) * age_multiplier
 
             per_gas_totals[gas_norm] += emissions_kg
 
@@ -835,112 +854,119 @@ def process_rows_backend(rows, selected_gases):
 
             "unit": unit,
 
-            "row_emissions": row_emissions
+            "row_emissions": row_emissions,
+
+            "manufacturing_year": r.get("manufacturing_year"),
+
+            "present_year": r.get("present_year"),
+
+            "vehicle_age_years": r.get("vehicle_age_years"),
+
+            "age_emission_multiplier": age_multiplier if key in ("petrol", "diesel") and r.get("vehicle_age_years") is not None else 1.0
 
         })
 
 
 
     total_co2_equivalent = 0.0
-
     for gas, kg in per_gas_totals.items():
-
         total_co2_equivalent += kg * gwp.get(gas, 0)
 
-
-
-    update_stats(total_co2_equivalent)
-
+    # Classify the calculated total before creating recommendations.
     classification = classify(total_co2_equivalent, thresholds)
 
+    # Generate recommendations only for activities included in the results.
+    activity_types = {
+        str(item.get("activity_type", "")).strip().lower()
+        for item in activities_out
+    }
+
+    has_petrol = any(
+        "petrol" in activity or "gasoline" in activity
+        for activity in activity_types
+    )
+    has_diesel = any("diesel" in activity for activity in activity_types)
+    has_electricity = any("electricity" in activity for activity in activity_types)
+
+    suggestions = []
+
+    if has_petrol:
+        suggestions.extend([
+            "For petrol vehicles, avoid unnecessary trips, reduce engine idling and plan shorter, efficient routes.",
+            "Maintain correct tyre pressure, service the engine regularly and avoid sudden acceleration to improve petrol efficiency."
+        ])
+
+    if has_diesel:
+        suggestions.extend([
+            "For diesel vehicles, avoid excessive idling, maintain the fuel injection system and replace air filters regularly.",
+            "Avoid overloading, maintain correct tyre pressure and plan efficient routes to reduce diesel consumption."
+        ])
+
+    if has_electricity:
+        suggestions.extend([
+            "Reduce electricity consumption by using LED lighting, energy-efficient appliances and switching off unused devices.",
+            "Monitor monthly electricity usage and consider renewable electricity sources where available."
+        ])
+
+    if not suggestions:
+        suggestions.extend([
+            "Continue monitoring your carbon footprint and identify activities with the highest emissions.",
+            "Set practical emission-reduction targets and review your progress regularly."
+        ])
+
     if classification == "High":
-
-        suggestions = [
-
-            "Consider energy-efficiency upgrades, switch to renewable electricity, and optimize logistics to reduce fuel consumption.",
-
-            "Review top emitting activities for targeted interventions."
-
-        ]
-
+        suggestions.append(
+            "Your overall estimated carbon footprint is high. Prioritize reducing the activities contributing most to your emissions."
+        )
     elif classification == "Medium":
-
-        suggestions = [
-
-            "Good progress — consider targeted interventions like LED upgrades, thermostat optimization, and routing improvements.",
-
-            "Track high-emitting activities monthly."
-
-        ]
-
+        suggestions.append(
+            "Your overall estimated carbon footprint is moderate. Continue improving efficiency and monitor your emissions regularly."
+        )
     else:
+        suggestions.append(
+            "Your overall estimated carbon footprint is low. Maintain your current practices and continue monitoring your emissions."
+        )
 
-        suggestions = [
-
-            "Great job — keep monitoring and consider offsetting remaining emissions if needed.",
-
-            "Consider continuous improvement measures and set reduction targets."
-
-        ]
-
-
-
-    # ensure all GAS_ORDER keys present
-
-    per_gas_out = {g: round(per_gas_totals.get(g, 0.0), 6) for g in GAS_ORDER}
-
+    # Ensure all gases appear in the result, including gases with zero emissions.
+    per_gas_out = {
+        gas: round(per_gas_totals.get(gas, 0.0), 6)
+        for gas in GAS_ORDER
+    }
     labels = list(per_gas_out.keys())
+    values = [round(per_gas_out[gas], 3) for gas in labels]
 
-    values = [round(per_gas_out[k], 3) for k in labels]
+    # Calculate CO2-equivalent totals for each activity.
+    for activity in activities_out:
+        total_row_co2e = sum(
+            kg * gwp.get(gas, 0)
+            for gas, kg in activity["row_emissions"].items()
+        )
+        activity["total_co2e_kg"] = total_row_co2e
+        activity["total_co2_kg"] = total_row_co2e
 
+    top_activities = sorted(
+        activities_out,
+        key=lambda item: item["total_co2_kg"],
+        reverse=True
+    )[:10]
 
-
-    for a in activities_out:
-
-        total_row_co2e = 0.0
-
-        for g, kg in a["row_emissions"].items():
-
-            total_row_co2e += kg * gwp.get(g, 0)
-
-        a["total_co2e_kg"] = total_row_co2e
-
-        a["total_co2_kg"] = total_row_co2e
-
-
-
-    top_activities = sorted(activities_out, key=lambda x: x["total_co2_kg"], reverse=True)[:10]
-
-    summary_line = f"Estimated total CO2: {round(total_co2_equivalent,3)} kg CO2 — {classification}."
+    summary_line = (
+        f"Estimated total CO2: {round(total_co2_equivalent, 3)} kg CO2 — {classification}."
+    )
 
     response = {
-
         "rows_processed": processed_count,
-
         "rows_skipped": len(rows_skipped),
-
         "skipped_details": rows_skipped,
-
         "per_gas_totals_kg": per_gas_out,
-
         "total_co2_kg": round(total_co2_equivalent, 6),
-
         "classification": classification,
-
         "suggestions": suggestions,
-
         "chart_data": {"labels": labels, "values": values},
-
         "top_activities": top_activities,
-
         "summary_line": summary_line,
-
-        # Include the selected gases/mode and the input rows so PDF can show them
-
         "selected_gases": selected_gases,
-
         "input_rows": rows
-
     }
 
     return response
@@ -2014,12 +2040,29 @@ def upload_page():
 
   .calc-row{margin-top:12px}
 
+  /* Compact, aligned input grids for electricity and transport */
+  .entry-grid{display:grid;grid-template-columns:1.15fr 1fr 1fr;gap:14px;align-items:end;margin-top:18px}
+  .entry-field{min-width:0}
+  .entry-field label{display:block;font-size:13px;font-weight:600;color:#173b55;margin-bottom:7px}
+  .entry-field input,.entry-field select{box-sizing:border-box;width:100%;min-width:0;height:44px;padding:10px 12px;border:1px solid #cbd9e4;border-radius:9px;background:#fbfdff;color:#123;font:inherit;transition:border-color .18s,box-shadow .18s}
+  .entry-field input:focus,.entry-field select:focus{outline:none;border-color:#1976dc;box-shadow:0 0 0 3px rgba(25,118,220,.12)}
+  .entry-hint{margin-top:7px;color:#718096;font-size:11px;line-height:1.35}
+  .entry-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:18px}
+  .entry-actions button{min-height:42px;padding:9px 18px}
+  .transport-form{margin-top:14px;padding-top:14px;border-top:1px dashed #dbe6ef}
+  .transport-form .entry-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:14px}
+  .transport-form .entry-field input{height:42px}
+  .transport-note{margin-top:12px;padding:10px 12px;background:#f4f8fc;border:1px solid #e1ebf3;border-radius:9px;color:#64748b;font-size:12px;line-height:1.45}
   @media (max-width:900px){
 
     .two-cols{flex-direction:column}
 
     .right-col{width:100%}
 
+  }
+  @media (max-width:700px){
+    .entry-grid,.transport-form .entry-grid{grid-template-columns:1fr;gap:12px}
+    .entry-field input,.entry-field select{height:46px}
   }
 
 
@@ -2183,7 +2226,7 @@ body {
   </svg>
 </div>
 
-      <h1>Upload & Results</h1>
+      <h1>Carbon Footprint Calculator</h1>
 
       <div class="small">Selected gases: <strong id="selected_gases">{{selected_display}}</strong></div>
 
@@ -2207,40 +2250,39 @@ body {
 
       <div class="card">
 
-        <h3>Upload (CSV, PDF or electricity bill image)</h3>
+        <h3>Electricity consumption</h3>
+        <p class="small">Enter the total electrical energy consumed during the selected period.</p>
 
-        <div id="dropzone" class="drop">Drag & Drop CSV, PDF or bill image here or click to select</div>
-
-        <input id="file_input" type="file" accept=".csv,.pdf,image/png,image/jpeg,image/webp" style="display:none" />
-
-        <div id="file_meta" class="small" style="margin-top:8px"></div>
-
-        <div id="error" class="error" style="display:none;margin-top:8px"></div>
-
-        <div id="bill_image_preview_wrap" style="display:none;margin-top:12px;text-align:left">
-          <div class="small">Bill selected. Click Calculate to read the bill automatically and estimate its electricity emissions.</div>
-          <img id="bill_image_preview" alt="Electricity bill preview" style="display:none;max-width:100%;max-height:280px;margin-top:12px;border-radius:10px;border:1px solid #d5e2eb">
+        <div class="entry-grid electricity-grid">
+          <div class="entry-field">
+            <label for="electricity_kwh">Electricity consumed (kWh)</label>
+            <input id="electricity_kwh" type="number" min="0.001" step="any" placeholder="e.g. 250" />
+            <div class="entry-hint">Total energy consumed</div>
+          </div>
+          <div class="entry-field">
+            <label for="electricity_period_unit">Consumption period</label>
+            <select id="electricity_period_unit">
+              <option value="days">Days</option>
+              <option value="months">Months</option>
+              <option value="years">Years</option>
+            </select>
+            <div class="entry-hint">Choose one time unit</div>
+          </div>
+          <div class="entry-field">
+            <label for="electricity_period_value">Number of units</label>
+            <input id="electricity_period_value" type="number" min="1" step="1" placeholder="e.g. 30" />
+            <div class="entry-hint">Enter days, months or years</div>
+          </div>
         </div>
 
-        <div id="calc_box" class="calc-row" style="display:none">
+        <div id="error" class="error" style="display:none;margin-top:12px"></div>
 
-          <button id="calculate_btn" class="btn">Calculate</button>
-
-          <button id="clear_btn" style="margin-left:8px;background:#fff;border:1px solid #e6e9ef;color:#0b3a66;padding:8px 12px;border-radius:8px">Clear</button>
-
+        <div class="entry-actions">
+          <button id="electricity_calculate" class="btn">Calculate</button>
+          <button id="electricity_clear" style="background:#fff;border:1px solid #d8e3ec;color:#0b3a66;border-radius:9px">Clear</button>
         </div>
 
-
-
-        <div id="preview_block" style="display:none;margin-top:12px" class="card">
-
-          <h4>Preview (first rows of CSV)</h4><div id="preview" class="preview"></div>
-
-        </div>
-
-
-
-        <div style="margin-top:8px;color:#6b7280;font-size:13px">After calculating you will be redirected to a results page (new sheet) showing the chart and details.</div>
+        <div class="small" style="margin-top:10px">The result represents emissions for the entered kWh over the selected period. The period is also recorded in the results.</div>
 
 
 
@@ -2256,7 +2298,7 @@ body {
 
         <h4>Transportation usage</h4>
 
-        <p class="small">Quick manual input for vehicle fuel (petrol/diesel). Enter liters and press <strong>Calculate</strong> to compute emissions.</p>
+        <p class="small">Enter fuel consumed and vehicle manufacturing details to calculate transportation emissions.</p>
 
         <div>
 
@@ -2274,21 +2316,26 @@ body {
 
 
 
-          <div class="tf-row">
-
-            <input id="liters_input" placeholder="liters" />
-
-            <button style="margin-left:8px;background:#fff;border:1px solid #e6e9ef;color:#0b3a66;padding:8px 12px;border-radius:8px" onclick="clearTransportForm()">Clear</button>
-
+          <div class="entry-grid transport-entry-grid">
+            <div class="entry-field">
+              <label for="liters_input">Fuel consumed (litres)</label>
+              <input id="liters_input" type="number" min="0.001" step="any" placeholder="e.g. 45" />
+            </div>
+            <div class="entry-field">
+              <label for="manufacture_year">Manufacturing year</label>
+              <input id="manufacture_year" type="number" min="1900" step="1" placeholder="e.g. 2018" />
+            </div>
+            <div class="entry-field">
+              <label for="present_year">Present year</label>
+              <input id="present_year" type="number" min="1900" step="1" placeholder="e.g. 2026" />
+            </div>
           </div>
 
-
-
-          <div style="margin-top:10px">
-
+          <div class="entry-actions">
             <button id="transport_calc" class="btn" onclick="calculateTransport()">Calculate</button>
-
+            <button style="background:#fff;border:1px solid #d8e3ec;color:#0b3a66;border-radius:9px" onclick="clearTransportForm()">Clear</button>
           </div>
+          <div class="transport-note">Emissions use fuel consumed (litres), the petrol/diesel emission factor, and an estimated vehicle-age adjustment.</div>
 
         </div>
 
@@ -2311,181 +2358,62 @@ body {
 <script>
 
 const selectedGases = {{selected_json|safe}};
-
 document.getElementById('selected_gases').innerText = selectedGases.join(', ') || 'None';
 
-
-
-const drop = document.getElementById('dropzone');
-
-const fileInput = document.getElementById('file_input');
-
-const fileMeta = document.getElementById('file_meta');
-
 const errElm = document.getElementById('error');
-
-const calcBox = document.getElementById('calc_box');
-
-const calcBtn = document.getElementById('calculate_btn');
-
-const clearBtn = document.getElementById('clear_btn');
-
-let uploadedFile = null;
-
-let uploadedIsCsv = false;
-let uploadedIsPdf = false;
-
-
-
 function showError(msg){ errElm.style.display='block'; errElm.innerText = msg; }
-
 function clearError(){ errElm.style.display='none'; errElm.innerText = ''; }
 
-
-
-drop.addEventListener('click', ()=> fileInput.click());
-
-drop.addEventListener('dragover', e=> { e.preventDefault(); drop.style.background='#eef'; });
-
-drop.addEventListener('dragleave', ()=> { drop.style.background=''; });
-
-drop.addEventListener('drop', e=> { e.preventDefault(); drop.style.background=''; handleFile(e.dataTransfer.files[0]); });
-
-fileInput.addEventListener('change', e=> handleFile(e.target.files[0]));
-
-clearBtn.addEventListener('click', ()=> {
-  uploadedFile=null; uploadedIsCsv=false; uploadedIsPdf=false;
-  fileMeta.innerText=''; calcBox.style.display='none';
-  document.getElementById('preview_block').style.display='none';
-  document.getElementById('bill_image_preview_wrap').style.display='none';
-  document.getElementById('bill_image_preview').style.display='none';
-  fileInput.value='';
+document.getElementById('electricity_calculate').addEventListener('click', async () => {
   clearError();
+  const kwh = Number(document.getElementById('electricity_kwh').value);
+  const periodUnit = document.getElementById('electricity_period_unit').value;
+  const periodValueRaw = document.getElementById('electricity_period_value').value.trim();
+  const periodValue = Number(periodValueRaw);
+
+  if (!Number.isFinite(kwh) || kwh <= 0) {
+    showError('Enter a valid positive electricity consumption in kWh.');
+    return;
+  }
+  if (!periodValueRaw || !Number.isInteger(periodValue) || periodValue <= 0) {
+    showError('Enter a positive whole number for the selected period.');
+    return;
+  }
+
+  const periodLabel = `${periodValue} ${periodUnit}`;
+  const rows = [{
+    source_id: 'Manual electricity entry',
+    activity_date: new Date().toISOString().slice(0, 10),
+    activity_type: 'electricity',
+    quantity: kwh,
+    unit: 'kWh',
+    gas: '',
+    period_value: periodValue,
+    period_unit: periodUnit,
+    period_label: periodLabel
+  }];
+
+  try {
+    const res = await fetch('/api/process_rows', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({rows, gases:selectedGases})
+    });
+    const data = await res.json();
+    if (!res.ok) { showError(data.error || 'Electricity calculation failed.'); return; }
+    if (data.redirect) window.location.href = data.redirect;
+    else showError('Unexpected response from server.');
+  } catch (error) {
+    showError('Could not calculate electricity emissions. Please try again.');
+  }
 });
 
-
-
-function isPdfFile(file){ if (!file) return false; const n=(file.name||'').toLowerCase(); return n.endsWith('.pdf') || file.type==='application/pdf'; }
-
-function isCsvFile(file){ if (!file) return false; const n = (file.name||'').toLowerCase(); return n.endsWith('.csv') || (file.type && file.type.includes('csv')); }
-
-function isImageFile(file){ if (!file) return false; return (file.type && file.type.startsWith('image/')) || (file.name||'').toLowerCase().match(/\.(png|jpe?g|webp|gif)$/); }
-
-
-
-function handleFile(file){
-
+document.getElementById('electricity_clear').addEventListener('click', () => {
+  document.getElementById('electricity_kwh').value = '';
+  document.getElementById('electricity_period_unit').value = 'days';
+  document.getElementById('electricity_period_value').value = '';
   clearError();
-
-  if (!file) return;
-
-  uploadedFile = file;
-
-  fileMeta.innerText = `Selected: ${file.name} (${file.size} bytes)`;
-  calcBox.style.display = 'block';
-  uploadedIsCsv = false;
-  uploadedIsPdf = false;
-  document.getElementById('bill_image_preview_wrap').style.display = 'none';
-  document.getElementById('bill_image_preview').style.display = 'none';
-
-  if (isCsvFile(file)){
-
-    uploadedIsCsv = true;
-
-    const reader = new FileReader();
-
-    reader.onload = ()=> {
-
-      const txt = reader.result;
-
-      const rows = txt.split(/**\r**?**\n**/).filter(Boolean).slice(0,6);
-
-      document.getElementById('preview').innerText = rows.join('**\\**&#x6E;');
-
-      document.getElementById('preview_block').style.display = 'block';
-
-    };
-
-    reader.readAsText(file);
-
-    return;
-
-  }
-
-  if (isPdfFile(file)){
-    uploadedIsPdf = true;
-    document.getElementById('preview_block').style.display = 'none';
-    document.getElementById('bill_image_preview_wrap').style.display = 'block';
-    return;
-  }
-
-  if (isImageFile(file)){
-    document.getElementById('preview_block').style.display = 'none';
-    document.getElementById('bill_image_preview_wrap').style.display = 'block';
-    const preview = document.getElementById('bill_image_preview');
-    preview.src = URL.createObjectURL(file);
-    preview.style.display = 'block';
-    return;
-  }
-
-  uploadedFile = null;
-  calcBox.style.display = 'none';
-  showError('Unsupported file type. Upload CSV, PDF, JPG, JPEG or PNG.');
-
-}
-
-
-
-calcBtn.addEventListener('click', async ()=> {
-
-  clearError();
-
-  if (!uploadedFile){ showError('Select a file first'); return; }
-
-  if (uploadedIsCsv){
-
-    const fd = new FormData();
-
-    fd.append('file', uploadedFile);
-
-    fd.append('mapping', JSON.stringify({}));
-
-    fd.append('gases', JSON.stringify(selectedGases));
-
-    const res = await fetch('/api/upload', { method:'POST', body: fd });
-
-    const data = await res.json();
-
-    if (!res.ok){ showError(data.error || 'Upload failed'); return; }
-
-    if (data.redirect){
-
-      window.location.href = data.redirect;
-
-    } else {
-
-      showError('Unexpected response from server.');
-
-    }
-
-  } else {
-
-    const fd = new FormData();
-    fd.append('file', uploadedFile);
-    fd.append('gases', JSON.stringify(selectedGases));
-
-    const res = await fetch('/api/bill_upload', { method:'POST', body: fd });
-    const data = await res.json();
-
-    if (!res.ok){ showError(data.error || 'Bill processing failed'); return; }
-    if (data.redirect){ window.location.href = data.redirect; }
-    else { showError('Unexpected response from server.'); }
-
-  }
-
 });
-
-
 
  // Transport quick form
 
@@ -2500,63 +2428,63 @@ function openTransportForm(type){
   document.getElementById('transport_type').innerText = type.charAt(0).toUpperCase() + type.slice(1);
 
   document.getElementById('liters_input').value = '';
+  document.getElementById('manufacture_year').value = '';
+  document.getElementById('present_year').value = '';
 
 }
 
 function clearTransportForm(){
-
   document.getElementById('liters_input').value = '';
-
+  document.getElementById('manufacture_year').value = '';
+  document.getElementById('present_year').value = '';
+  clearError();
 }
 
 async function calculateTransport(){
-
   clearError();
+  if (!currentTransportType){ showError('Select Petrol or Diesel first.'); return; }
 
-  if (!currentTransportType){ showError('Select Petrol or Diesel first'); return; }
+  const liters = Number(document.getElementById('liters_input').value);
+  const manufactureYear = Number(document.getElementById('manufacture_year').value);
+  const presentYear = Number(document.getElementById('present_year').value);
+  const currentYear = new Date().getFullYear();
 
-  const v = document.getElementById('liters_input').value.trim();
-
-  if (!v){ showError('Enter liters'); return; }
-
-  const n = Number(v);
-
-  if (isNaN(n) || n <= 0){ showError('Enter a positive number for liters'); return; }
-
-  const rows = [{
-
-    "source_id": "",
-
-    "activity_date": "",
-
-    "activity_type": currentTransportType,
-
-    "quantity": n,
-
-    "unit": "liter",
-
-    "gas": ""
-
-  }];
-
-  const payload = { rows: rows, gases: selectedGases };
-
-  const res = await fetch('/api/process_rows', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-
-  const data = await res.json();
-
-  if (!res.ok){ showError(data.error || 'Processing failed'); return; }
-
-  if (data.redirect){
-
-    window.location.href = data.redirect;
-
-  } else {
-
-    showError('Unexpected response from server.');
-
+  if (!Number.isFinite(liters) || liters <= 0){
+    showError('Enter a valid positive fuel quantity in litres.'); return;
+  }
+  if (!Number.isInteger(manufactureYear) || manufactureYear < 1900 || manufactureYear > currentYear){
+    showError(`Enter a valid manufacturing year between 1900 and ${currentYear}.`); return;
+  }
+  if (!Number.isInteger(presentYear) || presentYear < manufactureYear || presentYear > currentYear){
+    showError(`Enter a present year between ${manufactureYear} and ${currentYear}.`); return;
   }
 
+  const vehicleAge = presentYear - manufactureYear;
+  const rows = [{
+    source_id: `${currentTransportType} vehicle`,
+    activity_date: new Date().toISOString().slice(0, 10),
+    activity_type: currentTransportType,
+    quantity: liters,
+    unit: 'liter',
+    gas: '',
+    manufacturing_year: manufactureYear,
+    present_year: presentYear,
+    vehicle_age_years: vehicleAge
+  }];
+
+  try {
+    const res = await fetch('/api/process_rows', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({rows, gases:selectedGases})
+    });
+    const data = await res.json();
+    if (!res.ok){ showError(data.error || 'Transportation calculation failed.'); return; }
+    if (data.redirect){ window.location.href = data.redirect; }
+    else { showError('Unexpected response from server.'); }
+  } catch (error) {
+    showError('Could not calculate transportation emissions. Please try again.');
+  }
 }
 
 </script>
@@ -2768,6 +2696,57 @@ def api_process_rows():
     gases = data.get('gases', [])
 
     result = process_rows_backend(rows, gases)
+
+    # Add period/vehicle context while keeping the main emissions total
+    # based on the actual kWh or litres entered.
+    detail_messages = []
+    for row in rows:
+        if row.get("period_label"):
+            try:
+                period_value = float(row.get("period_value"))
+                period_unit = str(row.get("period_unit", "")).lower()
+                if period_unit == "days":
+                    period_days = period_value
+                elif period_unit == "months":
+                    period_days = period_value * (365.25 / 12.0)
+                elif period_unit == "years":
+                    period_days = period_value * 365.25
+                else:
+                    period_days = 0
+
+                if period_days > 0:
+                    kwh = float(row.get("quantity"))
+                    daily_average = kwh / period_days
+                    annualized_kwh = daily_average * 365.25
+                    annualization_factor = annualized_kwh / kwh if kwh > 0 else 0
+                    annualized_co2e = float(result.get("total_co2_kg", 0)) * annualization_factor
+                    result["annualized_electricity"] = {
+                        "average_kwh_per_day": round(daily_average, 4),
+                        "annualized_kwh": round(annualized_kwh, 4),
+                        "annualized_co2e_kg": round(annualized_co2e, 4),
+                        "period_label": row.get("period_label")
+                    }
+                    detail_messages.append(
+                        f"Electricity period: {row.get('period_label')}; "
+                        f"average: {daily_average:.2f} kWh/day; "
+                        f"annualized usage: {annualized_kwh:.2f} kWh/year; "
+                        f"annualized footprint: {annualized_co2e:.2f} kg CO2e/year"
+                    )
+            except (TypeError, ValueError):
+                pass
+
+        if row.get("vehicle_age_years") is not None:
+            detail_messages.append(
+                f"Vehicle age: {row.get('vehicle_age_years')} years "
+                f"(manufactured {row.get('manufacturing_year')}; "
+                f"reference year {row.get('present_year')}; "
+                f"age adjustment: {1.00 if int(row.get('vehicle_age_years') or 0) <= 5 else 1.10 if int(row.get('vehicle_age_years') or 0) <= 10 else 1.20 if int(row.get('vehicle_age_years') or 0) <= 15 else 1.30:.2f}x)"
+            )
+
+    if detail_messages:
+        result["summary_line"] = (
+            result.get("summary_line", "") + " " + " | ".join(detail_messages)
+        )
 
     redirect_url = save_result_and_get_url(result)
 
@@ -3407,7 +3386,7 @@ def download_pdf():
 
         # Build table
 
-        data_tbl = [["Activity", "Qty", "Unit", "Gas"]]
+        data_tbl = [["Activity", "Qty", "Unit", "Gas", "Details"]]
 
         for r in input_rows:
 
@@ -3429,9 +3408,19 @@ def download_pdf():
 
                 qty_s = str(qty)
 
-            data_tbl.append([act, qty_s, unit, gas])
+            details = ""
+            if r.get("period_label"):
+                details = f"Consumption period: {r.get('period_label')}"
+            if r.get("manufacturing_year") is not None:
+                details = (
+                    f"Manufactured: {r.get('manufacturing_year')}; "
+                    f"Present year: {r.get('present_year')}; "
+                    f"Vehicle age: {r.get('vehicle_age_years')} years; "
+                    f"age adjustment: {1.00 if int(r.get('vehicle_age_years') or 0) <= 5 else 1.10 if int(r.get('vehicle_age_years') or 0) <= 10 else 1.20 if int(r.get('vehicle_age_years') or 0) <= 15 else 1.30:.2f}x"
+                )
+            data_tbl.append([act, qty_s, unit, gas, details])
 
-        col_w = [70*mm, 30*mm, 30*mm, 30*mm]
+        col_w = [48*mm, 22*mm, 20*mm, 18*mm, 62*mm]
 
         inputs_table = Table(data_tbl, colWidths=col_w, hAlign='LEFT')
 
