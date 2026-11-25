@@ -6,6 +6,7 @@ import json
 import base64
 import re
 import uuid
+import requests
 
 from datetime import datetime
 from collections import defaultdict
@@ -497,41 +498,174 @@ def extract_kwh_from_image(image_path):
         return None, f"Could not read this bill image: {exc}"
 
 
-def extract_kwh_from_pdf(pdf_path):
-    """Read selectable PDF text first; use local OCR for scanned PDF pages."""
-    text = ""
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(pdf_path)
-        text = "\n".join((page.extract_text() or "") for page in reader.pages)
-    except Exception:
-        pass
-    quantity, error = _extract_kwh_from_text(text)
-    if quantity is not None:
-        return quantity, None
+def _ocr_space_read(file_path):
+    """Read an electricity bill using OCR.space cloud OCR."""
+
+    api_key = os.environ.get("OCR_SPACE_API_KEY", "").strip()
+
+    if not api_key:
+        return None, "OCR_SPACE_API_KEY is missing from environment variables."
 
     try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        return None, "Scanned PDF OCR support is missing. Install project requirements with: python -m pip install -r requirements.txt"
-    try:
-        doc = fitz.open(pdf_path)
-        page_text = []
-        for page in doc:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-            image_bytes = pix.tobytes("png")
-            from PIL import Image
-            import io as _io
-            with Image.open(_io.BytesIO(image_bytes)) as image:
-                pytesseract = _configure_tesseract()
-                if pytesseract is None:
-                    return None, "Local OCR package is missing. Run: python -m pip install -r requirements.txt"
-                page_text.append(pytesseract.image_to_string(image, config="--oem 3 --psm 6"))
-        return _extract_kwh_from_text("\n".join(page_text))
+        with open(file_path, "rb") as bill_file:
+            response = requests.post(
+                "https://api.ocr.space/parse/image",
+                headers={"apikey": api_key},
+                files={
+                    "file": (
+                        os.path.basename(file_path),
+                        bill_file
+                    )
+                },
+                data={
+                    "language": "eng",
+                    "isOverlayRequired": "false",
+                    "OCREngine": "2"
+                },
+                timeout=55
+            )
+
+        if response.status_code != 200:
+            return None, f"OCR service returned HTTP {response.status_code}."
+
+        result = response.json()
+
+        if result.get("IsErroredOnProcessing"):
+            error = result.get("ErrorMessage", "OCR processing failed.")
+            if isinstance(error, list):
+                error = " ".join(str(item) for item in error)
+            return None, str(error)
+
+        parsed_results = result.get("ParsedResults") or []
+
+        extracted_text = "\n".join(
+            item.get("ParsedText", "")
+            for item in parsed_results
+        )
+
+        if not extracted_text.strip():
+            return None, "No readable text found in the uploaded bill."
+
+        return extracted_text, None
+
+    except requests.Timeout:
+        return None, "OCR service timed out. Please try again."
+
+    except requests.RequestException as exc:
+        return None, f"Could not connect to OCR service: {exc}"
+
     except Exception as exc:
-        if "tesseract is not installed" in str(exc).lower() or "not found" in str(exc).lower():
-            return None, "Tesseract OCR is not installed. Install the free Tesseract program, then restart VS Code. See LOCAL_SETUP_FIX.md."
-        return None, f"Could not read this PDF: {exc}"
+        return None, f"OCR processing error: {exc}"
+
+
+def extract_kwh_from_image(image_path):
+    """Extract electricity consumption from an uploaded image."""
+
+    text, error = _ocr_space_read(image_path)
+
+    if error:
+        return None, error
+
+    return _extract_kwh_from_text(text)
+
+def _ocr_space_read(file_path):
+    """Read an electricity bill using OCR.space cloud OCR."""
+
+    api_key = os.environ.get("OCR_SPACE_API_KEY", "").strip()
+
+    if not api_key:
+        return None, "OCR_SPACE_API_KEY is missing from environment variables."
+
+    try:
+        with open(file_path, "rb") as bill_file:
+            response = requests.post(
+                "https://api.ocr.space/parse/image",
+                headers={"apikey": api_key},
+                files={
+                    "file": (
+                        os.path.basename(file_path),
+                        bill_file
+                    )
+                },
+                data={
+                    "language": "eng",
+                    "isOverlayRequired": "false",
+                    "OCREngine": "2"
+                },
+                timeout=55
+            )
+
+        if response.status_code != 200:
+            return None, f"OCR service returned HTTP {response.status_code}."
+
+        result = response.json()
+
+        if result.get("IsErroredOnProcessing"):
+            error = result.get("ErrorMessage", "OCR processing failed.")
+            if isinstance(error, list):
+                error = " ".join(str(item) for item in error)
+            return None, str(error)
+
+        parsed_results = result.get("ParsedResults") or []
+
+        extracted_text = "\n".join(
+            item.get("ParsedText", "")
+            for item in parsed_results
+        )
+
+        if not extracted_text.strip():
+            return None, "No readable text found in the uploaded bill."
+
+        return extracted_text, None
+
+    except requests.Timeout:
+        return None, "OCR service timed out. Please try again."
+
+    except requests.RequestException as exc:
+        return None, f"Could not connect to OCR service: {exc}"
+
+    except Exception as exc:
+        return None, f"OCR processing error: {exc}"
+
+
+def extract_kwh_from_image(image_path):
+    """Extract electricity consumption from an uploaded image."""
+
+    text, error = _ocr_space_read(image_path)
+
+    if error:
+        return None, error
+
+    return _extract_kwh_from_text(text)
+
+
+def extract_kwh_from_pdf(pdf_path):
+    """Read PDF text first, then use cloud OCR if necessary."""
+
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(pdf_path)
+
+        text = "\n".join(
+            page.extract_text() or ""
+            for page in reader.pages
+        )
+
+        quantity, error = _extract_kwh_from_text(text)
+
+        if quantity is not None:
+            return quantity, None
+
+    except Exception:
+        pass
+
+    text, error = _ocr_space_read(pdf_path)
+
+    if error:
+        return None, error
+
+    return _extract_kwh_from_text(text)
 
 
 def normalize_activity_key(act_type):
